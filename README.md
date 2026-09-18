@@ -120,6 +120,8 @@ Errors: `400 invalid_entry`, `404 not_found`, `409 idempotency_conflict`, `409 i
 
 **The database enforces what the application promises.** Immutability and balance are both checked in triggers. The application check gives a good error message; the trigger makes the promise hold even for a direct `psql` session.
 
+**The migrator takes its lock before it touches anything.** Several API instances can start against an empty database at once. `CREATE TABLE IF NOT EXISTS` is not atomic under concurrent creation in PostgreSQL — two sessions can both pass the check and one fails on the catalog's unique index. So the advisory lock is the first statement, before even the bookkeeping table. The test that runs six migrators in parallel found this; it was not designed in.
+
 **Plain SQL over an ORM.** A ledger's correctness lives in a dozen statements. They should be readable in the repository as written, with the `FOR UPDATE` visible.
 
 ## Not in scope, deliberately
@@ -128,7 +130,7 @@ Errors: `400 invalid_entry`, `404 not_found`, `409 idempotency_conflict`, `409 i
 - Authentication and rate limits.
 - Cached balances. The outbox exists so a projection can be built; none is built here.
 - A broker. The outbox is polled over HTTP; pushing it into Kafka or a queue is a consumer's job, not the ledger's.
-- Migrations beyond "apply the SQL files in order once".
+- Migrations beyond "apply the SQL files in order once, under a lock". Rollbacks are new forward migrations.
 
 ## Layout
 
