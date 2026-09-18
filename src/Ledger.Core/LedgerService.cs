@@ -106,11 +106,15 @@ public sealed class LedgerService(NpgsqlDataSource db)
 
     // ---------- holds ----------
 
-    /// <summary>Reserve funds. Nothing moves; the available balance drops until capture or release.</summary>
-    public async Task<Hold> AuthorizeAsync(string idempotencyKey, Guid accountId, long amount, CancellationToken ct = default)
+    /// <summary>
+    /// Reserve funds. Nothing moves; the available balance drops until the reservation is
+    /// captured, released, or — if <paramref name="timeout"/> is given — expires.
+    /// </summary>
+    public async Task<HoldView> AuthorizeAsync(string idempotencyKey, Guid accountId, long amount, TimeSpan? timeout = null, CancellationToken ct = default)
     {
         if (amount <= 0) throw new InvalidEntryException("hold amount must be positive");
-        var hash = Hash(new { accountId, amount });
+        if (timeout is { } t && t <= TimeSpan.Zero) throw new InvalidEntryException("hold timeout must be positive");
+        var hash = Hash(new { accountId, amount, timeout });
 
         await using var conn = await db.OpenConnectionAsync(ct);
         await using var tx = await conn.BeginTransactionAsync(ct);
@@ -124,88 +128,104 @@ public sealed class LedgerService(NpgsqlDataSource db)
             if (balance - held < amount) throw new InsufficientFundsException(accountId, balance - held, amount);
         }
 
-        var hold = new Hold(Guid.NewGuid(), idempotencyKey, accountId, amount, HoldStatus.Pending, null, DateTime.UtcNow, null);
+        var now = DateTime.UtcNow;
+        var hold = new Hold(Guid.NewGuid(), idempotencyKey, accountId, amount, now, timeout is { } to ? now + to : null);
         try
         {
             await conn.ExecuteAsync("""
-                insert into holds (id, idempotency_key, request_hash, account_id, amount, status, created_at)
-                values (@Id, @IdempotencyKey, @hash, @AccountId, @Amount, 'pending', @CreatedAt)
-                """, new { hold.Id, hold.IdempotencyKey, hash, hold.AccountId, hold.Amount, hold.CreatedAt }, tx);
+                insert into holds (id, idempotency_key, request_hash, account_id, amount, created_at, expires_at)
+                values (@Id, @IdempotencyKey, @hash, @AccountId, @Amount, @CreatedAt, @ExpiresAt)
+                """, new { hold.Id, hold.IdempotencyKey, hash, hold.AccountId, hold.Amount, hold.CreatedAt, hold.ExpiresAt }, tx);
             await tx.CommitAsync(ct);
-            return hold;
+            return new HoldView(hold, 0, 0, amount, HoldStatus.Open);
         }
         catch (PostgresException e) when (e.SqlState == PostgresErrorCodes.UniqueViolation)
         {
             await tx.RollbackAsync(ct);
-            var row = await conn.QuerySingleOrDefaultAsync<(Guid id, byte[] request_hash)>(
-                "select id, request_hash from holds where idempotency_key = @key", new { key = idempotencyKey });
-            if (row.id == default || !row.request_hash.AsSpan().SequenceEqual(hash)) throw new IdempotencyConflictException(idempotencyKey);
-            return (await QueryHoldAsync(conn, null, row.id))!;
+            return await FindHoldByKeyAsync(conn, null, idempotencyKey, hash)
+                   ?? throw new IdempotencyConflictException(idempotencyKey);
         }
     }
 
     /// <summary>
-    /// Settle a hold: move <paramref name="amount"/> (at most the held amount) to <paramref name="toAccountId"/>.
-    /// Any remainder is released. Capturing an already-captured hold again is a no-op that returns the same entry.
+    /// Settle part of a hold: move <paramref name="amount"/> (default: everything remaining) to
+    /// <paramref name="toAccountId"/>. A hold may be captured several times — a card authorization
+    /// is often cleared in more than one message — as long as the captures stay within the amount.
     /// </summary>
-    public async Task<(Hold Hold, Entry Entry)> CaptureAsync(Guid holdId, Guid toAccountId, long? amount = null, CancellationToken ct = default)
+    public async Task<(HoldView Hold, Entry Entry)> CaptureAsync(Guid holdId, string idempotencyKey, Guid toAccountId, long? amount = null, CancellationToken ct = default)
     {
         await using var conn = await db.OpenConnectionAsync(ct);
         await using var tx = await conn.BeginTransactionAsync(ct);
 
         var hold = await LockHoldAsync(conn, tx, holdId);
-        if (hold.Status == HoldStatus.Captured)
-        {
-            var already = await LoadEntryAsync(conn, tx, hold.CapturedEntry!.Value);
-            return (hold, already!);
-        }
-        if (hold.Status != HoldStatus.Pending) throw new InvalidHoldStateException($"hold {holdId} is {hold.Status}, cannot capture");
+        // Hash the request as the caller sent it. Resolving "everything remaining" first would
+        // make a replay hash differently once the first call has changed what remains.
+        var hash = Hash(new { holdId, toAccountId, amount });
+        if (await FindEntryByKeyAsync(conn, tx, idempotencyKey, hash) is { } existing)
+            return (hold, existing);
+        var captureAmount = amount ?? hold.Remaining;
 
-        var captureAmount = amount ?? hold.Amount;
-        if (captureAmount <= 0 || captureAmount > hold.Amount)
-            throw new InvalidHoldStateException($"capture of {captureAmount} is outside (0, {hold.Amount}]");
+        if (hold.Status != HoldStatus.Open) throw new InvalidHoldStateException($"hold {holdId} is {hold.Status.ToString().ToLowerInvariant()}, cannot capture");
+        if (captureAmount <= 0 || captureAmount > hold.Remaining)
+            throw new InvalidHoldStateException($"capture of {captureAmount} is outside (0, {hold.Remaining}] remaining on hold {holdId}");
 
-        // The hold already reserved the funds, so the balance check for the source is against
-        // balance minus *other* holds — this hold is the one being consumed.
-        var accounts = await LockAccountsAsync(conn, tx, [hold.AccountId, toAccountId]);
-        var source = accounts.Single(a => a.Id == hold.AccountId);
+        var accounts = await LockAccountsAsync(conn, tx, [hold.Hold.AccountId, toAccountId]);
+        var source = accounts.Single(a => a.Id == hold.Hold.AccountId);
         var dest = accounts.Single(a => a.Id == toAccountId);
         if (source.Currency != dest.Currency) throw new InvalidEntryException("capture across currencies is not supported");
+
+        // The reservation already covers this capture, so the source check is against
+        // balance minus *other* reservations. It cannot fail while the invariants hold;
+        // it stays here as a backstop.
         if (!source.AllowNegative)
         {
-            var (balance, held) = await BalanceAndHeldAsync(conn, tx, hold.AccountId);
-            var availableIncludingThisHold = balance - held + hold.Amount;
-            if (availableIncludingThisHold < captureAmount)
-                throw new InsufficientFundsException(hold.AccountId, availableIncludingThisHold, captureAmount);
+            var (balance, held) = await BalanceAndHeldAsync(conn, tx, source.Id);
+            var coverage = balance - held + hold.Remaining;
+            if (coverage < captureAmount) throw new InsufficientFundsException(source.Id, coverage, captureAmount);
         }
 
-        var entry = new Entry(Guid.NewGuid(), $"capture:{holdId}", $"capture of hold {holdId}", null, DateTime.UtcNow,
-            [new Posting(hold.AccountId, -captureAmount), new Posting(toAccountId, captureAmount)]);
-        await WriteEntryAsync(conn, tx, entry, Hash(new { holdId, toAccountId, captureAmount }), skipBalanceCheck: true);
-
-        await conn.ExecuteAsync(
-            "update holds set status = 'captured', captured_entry = @entryId, settled_at = now() where id = @holdId",
-            new { entryId = entry.Id, holdId }, tx);
+        var entry = new Entry(Guid.NewGuid(), idempotencyKey, $"capture of hold {holdId}", null, DateTime.UtcNow,
+            [new Posting(source.Id, -captureAmount), new Posting(toAccountId, captureAmount)]);
+        await WriteEntryAsync(conn, tx, entry, hash, skipBalanceCheck: true, holdId: holdId);
         await tx.CommitAsync(ct);
-        return (hold with { Status = HoldStatus.Captured, CapturedEntry = entry.Id, SettledAt = DateTime.UtcNow }, entry);
+
+        return ((await QueryHoldAsync(conn, null, holdId))!, entry);
     }
 
-    /// <summary>Drop a hold without moving money. Releasing twice is a no-op.</summary>
-    public async Task<Hold> ReleaseAsync(Guid holdId, CancellationToken ct = default)
+    /// <summary>
+    /// Give back part of a hold (default: everything remaining) without moving money.
+    /// Releasing a hold that has nothing left is a no-op.
+    /// </summary>
+    public async Task<HoldView> ReleaseAsync(Guid holdId, string idempotencyKey, long? amount = null, CancellationToken ct = default)
     {
         await using var conn = await db.OpenConnectionAsync(ct);
         await using var tx = await conn.BeginTransactionAsync(ct);
 
         var hold = await LockHoldAsync(conn, tx, holdId);
-        if (hold.Status == HoldStatus.Released) return hold;
-        if (hold.Status == HoldStatus.Captured) throw new InvalidHoldStateException($"hold {holdId} is captured, cannot release");
+        var hash = Hash(new { holdId, amount });
+        var releaseAmount = amount ?? hold.Remaining;
 
-        await conn.ExecuteAsync("update holds set status = 'released', settled_at = now() where id = @holdId", new { holdId }, tx);
+        var prior = await conn.QuerySingleOrDefaultAsync<(long id, byte[] request_hash)>(
+            "select id, request_hash from hold_releases where idempotency_key = @key", new { key = idempotencyKey }, tx);
+        if (prior.id != 0)
+        {
+            if (!prior.request_hash.AsSpan().SequenceEqual(hash)) throw new IdempotencyConflictException(idempotencyKey);
+            return hold;
+        }
+
+        if (releaseAmount == 0 && amount is null) return hold;   // nothing left to release
+        if (hold.Status == HoldStatus.Closed) throw new InvalidHoldStateException($"hold {holdId} is closed, nothing to release");
+        if (releaseAmount <= 0 || releaseAmount > hold.Remaining)
+            throw new InvalidHoldStateException($"release of {releaseAmount} is outside (0, {hold.Remaining}] remaining on hold {holdId}");
+
+        await conn.ExecuteAsync(
+            "insert into hold_releases (hold_id, idempotency_key, request_hash, amount) values (@holdId, @idempotencyKey, @hash, @releaseAmount)",
+            new { holdId, idempotencyKey, hash, releaseAmount }, tx);
         await tx.CommitAsync(ct);
-        return hold with { Status = HoldStatus.Released, SettledAt = DateTime.UtcNow };
+        return (await QueryHoldAsync(conn, null, holdId))!;
     }
 
-    public async Task<Hold> GetHoldAsync(Guid holdId, CancellationToken ct = default)
+    public async Task<HoldView> GetHoldAsync(Guid holdId, CancellationToken ct = default)
     {
         await using var conn = await db.OpenConnectionAsync(ct);
         return await QueryHoldAsync(conn, null, holdId) ?? throw new NotFoundException("hold", holdId);
@@ -227,7 +247,7 @@ public sealed class LedgerService(NpgsqlDataSource db)
     }
 
     /// <summary>Writes the entry rows after locking accounts and checking that no account is overdrawn.</summary>
-    private static async Task WriteEntryAsync(NpgsqlConnection conn, NpgsqlTransaction tx, Entry entry, byte[] hash, bool skipBalanceCheck = false)
+    private static async Task WriteEntryAsync(NpgsqlConnection conn, NpgsqlTransaction tx, Entry entry, byte[] hash, bool skipBalanceCheck = false, Guid? holdId = null)
     {
         var accountIds = entry.Postings.Select(p => p.AccountId).Distinct().ToArray();
         var accounts = await LockAccountsAsync(conn, tx, accountIds);
@@ -248,9 +268,9 @@ public sealed class LedgerService(NpgsqlDataSource db)
         }
 
         await conn.ExecuteAsync("""
-            insert into entries (id, idempotency_key, request_hash, description, reverses, created_at)
-            values (@Id, @IdempotencyKey, @hash, @Description, @Reverses, @CreatedAt)
-            """, new { entry.Id, entry.IdempotencyKey, hash, entry.Description, entry.Reverses, entry.CreatedAt }, tx);
+            insert into entries (id, idempotency_key, request_hash, description, reverses, hold_id, created_at)
+            values (@Id, @IdempotencyKey, @hash, @Description, @Reverses, @holdId, @CreatedAt)
+            """, new { entry.Id, entry.IdempotencyKey, hash, entry.Description, entry.Reverses, holdId, entry.CreatedAt }, tx);
         await conn.ExecuteAsync(
             "insert into postings (entry_id, account_id, amount) values (@EntryId, @AccountId, @Amount)",
             entry.Postings.Select(p => new { EntryId = entry.Id, p.AccountId, p.Amount }), tx);
@@ -266,11 +286,12 @@ public sealed class LedgerService(NpgsqlDataSource db)
         return rows;
     }
 
+    /// <summary>Balance is the sum of postings; held is the sum of what still remains on open holds.</summary>
     private static async Task<(long Balance, long Held)> BalanceAndHeldAsync(NpgsqlConnection conn, NpgsqlTransaction? tx, Guid accountId)
     {
         var row = await conn.QuerySingleAsync<(long balance, long held)>("""
             select (select coalesce(sum(amount), 0) from postings where account_id = @accountId)::bigint,
-                   (select coalesce(sum(amount), 0) from holds where account_id = @accountId and status = 'pending')::bigint
+                   (select coalesce(sum(remaining), 0) from hold_state where account_id = @accountId and status = 'open')::bigint
             """, new { accountId }, tx);
         return row;
     }
@@ -294,7 +315,7 @@ public sealed class LedgerService(NpgsqlDataSource db)
         return new Entry(head.id, head.key, head.description, head.reverses, head.created_at, postings);
     }
 
-    private static async Task<Hold?> FindHoldByKeyAsync(NpgsqlConnection conn, NpgsqlTransaction tx, string key, byte[] hash)
+    private static async Task<HoldView?> FindHoldByKeyAsync(NpgsqlConnection conn, NpgsqlTransaction? tx, string key, byte[] hash)
     {
         var row = await conn.QuerySingleOrDefaultAsync<(Guid id, byte[] request_hash)>(
             "select id, request_hash from holds where idempotency_key = @key", new { key }, tx);
@@ -303,16 +324,22 @@ public sealed class LedgerService(NpgsqlDataSource db)
         return await QueryHoldAsync(conn, tx, row.id);
     }
 
-    private static async Task<Hold> LockHoldAsync(NpgsqlConnection conn, NpgsqlTransaction tx, Guid holdId)
-        => await QueryHoldAsync(conn, tx, holdId, forUpdate: true) ?? throw new NotFoundException("hold", holdId);
-
-    private static async Task<Hold?> QueryHoldAsync(NpgsqlConnection conn, NpgsqlTransaction? tx, Guid holdId, bool forUpdate = false)
+    /// <summary>Locks the (immutable) hold row so concurrent captures and releases of one hold serialize.</summary>
+    private static async Task<HoldView> LockHoldAsync(NpgsqlConnection conn, NpgsqlTransaction tx, Guid holdId)
     {
-        var row = await conn.QuerySingleOrDefaultAsync<(Guid id, string key, Guid account_id, long amount, string status, Guid? captured_entry, DateTime created_at, DateTime? settled_at)>(
-            $"select id, idempotency_key, account_id, amount, status::text, captured_entry, created_at, settled_at from holds where id = @holdId{(forUpdate ? " for update" : "")}",
+        _ = await conn.QuerySingleOrDefaultAsync<Guid?>("select id from holds where id = @holdId for update", new { holdId }, tx)
+            ?? throw new NotFoundException("hold", holdId);
+        return (await QueryHoldAsync(conn, tx, holdId))!;
+    }
+
+    private static async Task<HoldView?> QueryHoldAsync(NpgsqlConnection conn, NpgsqlTransaction? tx, Guid holdId)
+    {
+        var r = await conn.QuerySingleOrDefaultAsync<(Guid id, string key, Guid account_id, long amount, DateTime created_at, DateTime? expires_at, long captured, long released, long remaining, string status)>(
+            "select id, idempotency_key, account_id, amount, created_at, expires_at, captured, released, remaining, status from hold_state where id = @holdId",
             new { holdId }, tx);
-        if (row.id == default) return null;
-        return new Hold(row.id, row.key, row.account_id, row.amount, Enum.Parse<HoldStatus>(row.status, ignoreCase: true), row.captured_entry, row.created_at, row.settled_at);
+        if (r.id == default) return null;
+        var hold = new Hold(r.id, r.key, r.account_id, r.amount, r.created_at, r.expires_at);
+        return new HoldView(hold, r.captured, r.released, r.remaining, Enum.Parse<HoldStatus>(r.status, ignoreCase: true));
     }
 
     private static byte[] Hash(object request)

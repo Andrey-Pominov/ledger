@@ -1,5 +1,7 @@
 using System.Net;
 using System.Net.Http.Json;
+using System.Text.Json;
+using System.Text.Json.Serialization;
 using Ledger.Api;
 using Ledger.Core;
 using Microsoft.AspNetCore.Mvc.Testing;
@@ -12,6 +14,8 @@ public sealed class ApiTests(PostgresFixture pg) : IDisposable
 {
     private readonly WebApplicationFactory<Program> _factory = new WebApplicationFactory<Program>()
         .WithWebHostBuilder(b => b.UseSetting("ConnectionStrings:Ledger", pg.ConnectionString));
+
+    private static readonly JsonSerializerOptions Json = new(JsonSerializerDefaults.Web) { Converters = { new JsonStringEnumConverter() } };
 
     public void Dispose() => _factory.Dispose();
 
@@ -44,20 +48,26 @@ public sealed class ApiTests(PostgresFixture pg) : IDisposable
 
         var auth = await http.PostAsJsonAsync("/holds", new AuthorizeRequest("auth-1", alice.Id, 1_200));
         Assert.Equal(HttpStatusCode.Created, auth.StatusCode);
-        var hold = (await auth.Content.ReadFromJsonAsync<Hold>())!;
+        var hold = (await auth.Content.ReadFromJsonAsync<HoldView>(Json))!;
 
         var afterHold = (await http.GetFromJsonAsync<AccountResponse>($"/accounts/{alice.Id}"))!;
         Assert.Equal(5_000, afterHold.Balance);
         Assert.Equal(3_800, afterHold.Available);
 
-        var capture = await http.PostAsJsonAsync($"/holds/{hold.Id}/capture", new CaptureRequest(shop.Id, 1_000));
+        var capture = await http.PostAsJsonAsync($"/holds/{hold.Hold.Id}/capture", new CaptureRequest("cap-1", shop.Id, 1_000));
         Assert.Equal(HttpStatusCode.OK, capture.StatusCode);
 
         var alicePost = (await http.GetFromJsonAsync<AccountResponse>($"/accounts/{alice.Id}"))!;
         var shopPost = (await http.GetFromJsonAsync<AccountResponse>($"/accounts/{shop.Id}"))!;
         Assert.Equal(4_000, alicePost.Balance);
-        Assert.Equal(4_000, alicePost.Available);
+        Assert.Equal(3_800, alicePost.Available);   // 200 of the hold is still open
         Assert.Equal(1_000, shopPost.Balance);
+
+        var release = await http.PostAsJsonAsync($"/holds/{hold.Hold.Id}/release", new ReleaseRequest("rel-1"));
+        Assert.Equal(HttpStatusCode.OK, release.StatusCode);
+        Assert.Equal(HoldStatus.Closed, (await release.Content.ReadFromJsonAsync<HoldView>(Json))!.Status);
+        Assert.Contains("\"status\":\"Closed\"", await release.Content.ReadAsStringAsync());
+        Assert.Equal(4_000, (await http.GetFromJsonAsync<AccountResponse>($"/accounts/{alice.Id}"))!.Available);
 
         var missing = await http.GetAsync($"/accounts/{Guid.NewGuid()}");
         Assert.Equal(HttpStatusCode.NotFound, missing.StatusCode);

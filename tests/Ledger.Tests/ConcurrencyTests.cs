@@ -51,6 +51,27 @@ public sealed class ConcurrencyTests(PostgresFixture pg)
     }
 
     [Fact]
+    public async Task Parallel_partial_captures_of_one_hold_never_exceed_it()
+    {
+        const int held = 300, each = 50, attempts = 12;   // only 6 of 12 fit
+        var a = await pg.FundedAccountAsync(1_000); var shop = await pg.AccountAsync("shop");
+        var hold = await Ledger.AuthorizeAsync(Guid.NewGuid().ToString(), a.Id, held);
+
+        var results = await Task.WhenAll(Enumerable.Range(0, attempts).Select(async i =>
+        {
+            try { await Ledger.CaptureAsync(hold.Hold.Id, $"cap-{hold.Hold.Id}-{i}", shop.Id, each); return true; }
+            catch (InvalidHoldStateException) { return false; }
+        }));
+
+        Assert.Equal(held / each, results.Count(ok => ok));
+        var view = await Ledger.GetHoldAsync(hold.Hold.Id);
+        Assert.Equal(HoldStatus.Closed, view.Status);
+        Assert.Equal(held, view.Captured);
+        Assert.Equal(held, (await Ledger.GetAccountAsync(shop.Id)).Balance);
+        Assert.Equal(1_000 - held, (await Ledger.GetAccountAsync(a.Id)).Balance);
+    }
+
+    [Fact]
     public async Task Parallel_requests_with_one_idempotency_key_write_exactly_once()
     {
         var a = await pg.FundedAccountAsync(1_000); var b = await pg.AccountAsync();
