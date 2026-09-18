@@ -73,6 +73,8 @@ holds.MapPost("/{id:guid}/capture", async (Guid id, CaptureRequest req, LedgerSe
 });
 holds.MapPost("/{id:guid}/release", async (Guid id, ReleaseRequest req, LedgerService ledger) => await ledger.ReleaseAsync(id, req.IdempotencyKey, req.Amount));
 
+app.MapGet("/events", async (long? after, int? limit, LedgerService ledger) => await ledger.EventsAsync(after ?? 0, limit ?? 100));
+
 app.MapGet("/health", () => Results.Ok(new { status = "ok" }));
 
 app.Run();

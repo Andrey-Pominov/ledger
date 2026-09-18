@@ -50,3 +50,9 @@ public sealed class NotFoundException(string what, Guid id) : LedgerException($"
 
 /// <summary>The hold is closed or expired, or the amount exceeds what remains on it.</summary>
 public sealed class InvalidHoldStateException(string message) : LedgerException(message);
+
+/// <summary>One row of the outbox: what changed, when, and the record as it was written.</summary>
+public sealed record LedgerEvent(long Id, string Type, DateTime OccurredAt, System.Text.Json.JsonElement Payload);
+
+/// <summary>A page of events plus the cursor to ask for the next one.</summary>
+public sealed record EventPage(IReadOnlyList<LedgerEvent> Events, long Next);

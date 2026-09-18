@@ -13,7 +13,9 @@ It is small on purpose. The point is not the feature list — it is that every r
 - **Every write is idempotent.** Each entry and hold carries a caller-supplied key. Replaying a request returns the original result and writes nothing; reusing a key with a different body is a `409`.
 - **Holds reserve without moving, and are never edited.** `authorize` lowers the available balance and writes one immutable row. `capture` moves money — a hold may be captured several times, the way a card authorization is often cleared in more than one message — and `release` gives back what remains. A hold's state (what was captured, what was released, what still reserves funds, whether it is open, closed or expired) is derived from the journal; nothing about it is updated in place. Expiry is a timestamp, not a job: an expired hold simply stops counting.
 
-The tests in [`tests/Ledger.Tests`](tests/Ledger.Tests) exercise each of these against PostgreSQL — including 40 parallel transfers against a balance that only covers 10 of them, 12 parallel partial captures of a hold that fits 6, and 16 parallel requests sharing one idempotency key.
+- **Every change is announced, exactly in journal order.** Each write appends one row to an outbox in the same transaction. `GET /events?after=<cursor>` reads it forward. Nothing is marked delivered: consumers own their cursors, follow at their own pace and resume after downtime. Delivery is at-least-once by construction, and a cursor can never skip a row that commits late.
+
+The tests in [`tests/Ledger.Tests`](tests/Ledger.Tests) exercise each of these against PostgreSQL — including 40 parallel transfers against a balance that only covers 10 of them, 12 parallel partial captures of a hold that fits 6, 16 parallel requests sharing one idempotency key, and an outbox reader facing a transaction that took an id and has not committed.
 
 ## Run it
 
@@ -71,6 +73,9 @@ curl -s -X POST localhost:8088/holds/$HOLD/release -H 'content-type: application
 curl -s localhost:8088/holds/$HOLD
 
 curl -s localhost:8088/accounts/$ALICE/statement
+
+# everything that happened, in order — a projection or a fraud check would start here
+curl -s 'localhost:8088/events?after=0&limit=100'
 ```
 
 | Method | Path | |
@@ -85,6 +90,7 @@ curl -s localhost:8088/accounts/$ALICE/statement
 | `GET` | `/holds/{id}` | the hold and its derived state |
 | `POST` | `/holds/{id}/capture` | move up to what remains; may be repeated with new keys (idempotent) |
 | `POST` | `/holds/{id}/release` | give back up to what remains (idempotent) |
+| `GET` | `/events?after=&limit=` | the outbox, forward from a cursor; `next` is the cursor for the following page |
 
 Errors: `400 invalid_entry`, `404 not_found`, `409 idempotency_conflict`, `409 invalid_hold_state`, `422 insufficient_funds`.
 
@@ -108,6 +114,8 @@ Errors: `400 invalid_entry`, `404 not_found`, `409 idempotency_conflict`, `409 i
 
 **Where this differs from TigerBeetle.** The account / two-phase transfer model here follows TigerBeetle's shape — pending, post, void, an id-based idempotency contract — because it is the right shape. TigerBeetle stores four counters per account (`debits_pending`, `debits_posted`, `credits_pending`, `credits_posted`) and updates them atomically with each transfer; this ledger stores none and derives everything from the journal. At TigerBeetle's scale the counters are the point. At this scale one invariant is easier to keep true than four, and the counters can be introduced later as a cache behind the same tests — which is the order these things should happen in.
 
+**The outbox is a table, and the cursor is not the sequence.** Events are rows written in the writer's own transaction — the only way to make "the change happened" and "the change was announced" the same fact. The tempting reader is `WHERE id > cursor`, and it is wrong: `bigserial` assigns ids at `INSERT`, not at `COMMIT`. Transaction A can take id 5, transaction B take 6 and commit first; a reader that sees 6 and moves on will never see 5. The reader therefore accepts only rows whose writing transaction (`xmin`) is older than every transaction still in progress — those cannot be overtaken any more. That rule is one `WHERE` clause in a view, [`events_stable`](db/migrations/003_outbox.sql), and one test that opens a transaction, takes an id, and checks that everything after it is held back until it commits. `xmin` is 32-bit, so the comparison is valid until xid wraparound; that is stated in the migration rather than hidden.
+
 **The database enforces what the application promises.** Immutability and balance are both checked in triggers. The application check gives a good error message; the trigger makes the promise hold even for a direct `psql` session.
 
 **Plain SQL over an ORM.** A ledger's correctness lives in a dozen statements. They should be readable in the repository as written, with the `FOR UPDATE` visible.
@@ -116,7 +124,8 @@ Errors: `400 invalid_entry`, `404 not_found`, `409 idempotency_conflict`, `409 i
 
 - Multi-currency entries and FX.
 - Authentication, rate limits, pagination.
-- Cached balances and an event stream (outbox) for downstream projections.
+- Cached balances. The outbox exists so a projection can be built; none is built here.
+- A broker. The outbox is polled over HTTP; pushing it into Kafka or a queue is a consumer's job, not the ledger's.
 - Migrations beyond "apply the SQL files in order once".
 
 ## Layout
@@ -124,6 +133,7 @@ Errors: `400 invalid_entry`, `404 not_found`, `409 idempotency_conflict`, `409 i
 ```
 db/migrations/001_init.sql     accounts, journal, the balance and immutability triggers
 db/migrations/002_immutable_holds.sql   holds become append-only; hold_state view derives the rest
+db/migrations/003_outbox.sql   events table and the events_stable view with the cursor rule
 src/Ledger.Core/               model, LedgerService (every operation is one transaction), Migrator
 src/Ledger.Api/                minimal API; domain errors → HTTP codes in one middleware
 tests/Ledger.Tests/            xUnit + Testcontainers: entries, holds, concurrency, HTTP
