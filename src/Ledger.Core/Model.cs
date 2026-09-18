@@ -14,10 +14,16 @@ public sealed record Posting(Guid AccountId, long Amount);
 /// <summary>An immutable, balanced group of postings.</summary>
 public sealed record Entry(Guid Id, string IdempotencyKey, string Description, Guid? Reverses, DateTime CreatedAt, IReadOnlyList<Posting> Postings);
 
-public enum HoldStatus { Pending, Captured, Released }
+public enum HoldStatus { Open, Expired, Closed }
 
-/// <summary>A reservation against an account's available balance. Money moves only on capture.</summary>
-public sealed record Hold(Guid Id, string IdempotencyKey, Guid AccountId, long Amount, HoldStatus Status, Guid? CapturedEntry, DateTime CreatedAt, DateTime? SettledAt);
+/// <summary>
+/// A reservation against an account's available balance, written once and never updated.
+/// What happened to it lives in the journal (captures) and in hold_releases (releases).
+/// </summary>
+public sealed record Hold(Guid Id, string IdempotencyKey, Guid AccountId, long Amount, DateTime CreatedAt, DateTime? ExpiresAt);
+
+/// <summary>A hold with its state derived from the journal: what was captured, released, and what still reserves funds.</summary>
+public sealed record HoldView(Hold Hold, long Captured, long Released, long Remaining, HoldStatus Status);
 
 /// <summary>One line of an account statement.</summary>
 public sealed record StatementLine(Guid EntryId, DateTime At, string Description, long Amount, long RunningBalance);
@@ -42,5 +48,5 @@ public sealed class IdempotencyConflictException(string key)
 
 public sealed class NotFoundException(string what, Guid id) : LedgerException($"{what} {id} not found");
 
-/// <summary>A hold is no longer pending, or capture exceeds the held amount.</summary>
+/// <summary>The hold is closed or expired, or the amount exceeds what remains on it.</summary>
 public sealed class InvalidHoldStateException(string message) : LedgerException(message);
