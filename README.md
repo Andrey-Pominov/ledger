@@ -11,9 +11,9 @@ It is small on purpose. The point is not the feature list — it is that every r
 - **The journal is append-only.** `UPDATE` and `DELETE` on `entries` and `postings` raise at the database level. Corrections are reversing entries that point at what they reverse.
 - **No account is overdrawn unless it is allowed to be.** The check runs under a row lock on the account, so two concurrent transfers cannot both pass a check that only one of them should.
 - **Every write is idempotent.** Each entry and hold carries a caller-supplied key. Replaying a request returns the original result and writes nothing; reusing a key with a different body is a `409`.
-- **Holds reserve without moving.** `authorize` lowers the available balance; `capture` moves the money (partial capture releases the rest); `release` gives it back. Capture and release are themselves idempotent. This is a card authorization → clearing cycle without the card.
+- **Holds reserve without moving, and are never edited.** `authorize` lowers the available balance and writes one immutable row. `capture` moves money — a hold may be captured several times, the way a card authorization is often cleared in more than one message — and `release` gives back what remains. A hold's state (what was captured, what was released, what still reserves funds, whether it is open, closed or expired) is derived from the journal; nothing about it is updated in place. Expiry is a timestamp, not a job: an expired hold simply stops counting.
 
-The tests in [`tests/Ledger.Tests`](tests/Ledger.Tests) exercise each of these against PostgreSQL — including 40 parallel transfers against a balance that only covers 10 of them, and 16 parallel requests sharing one idempotency key.
+The tests in [`tests/Ledger.Tests`](tests/Ledger.Tests) exercise each of these against PostgreSQL — including 40 parallel transfers against a balance that only covers 10 of them, 12 parallel partial captures of a hold that fits 6, and 16 parallel requests sharing one idempotency key.
 
 ## Run it
 
@@ -52,16 +52,23 @@ curl -s -X POST localhost:8088/entries -H 'content-type: application/json' -d "{
 # send it again: same entry back, nothing written
 # send it again with a different amount: 409 idempotency_conflict
 
-# reserve 12.00 — balance stays 50.00, available drops to 38.00
+# reserve 12.00 for up to an hour — balance stays 50.00, available drops to 38.00
 HOLD=$(curl -s -X POST localhost:8088/holds -H 'content-type: application/json' \
-  -d "{\"idempotencyKey\":\"auth-1\",\"accountId\":\"$ALICE\",\"amount\":1200}" | jq -r .id)
+  -d "{\"idempotencyKey\":\"auth-1\",\"accountId\":\"$ALICE\",\"amount\":1200,\"timeoutSeconds\":3600}" | jq -r .hold.id)
 curl -s localhost:8088/accounts/$ALICE
 
 # try to spend 40.00 while 12.00 is held: 422 insufficient_funds
 
-# settle 10.00 of the hold to a shop; the other 2.00 is released
+# clear 7.00 of it to a shop, then another 3.00 — two captures against one authorization
 curl -s -X POST localhost:8088/holds/$HOLD/capture -H 'content-type: application/json' \
-  -d "{\"toAccountId\":\"$SHOP\",\"amount\":1000}"
+  -d "{\"idempotencyKey\":\"clr-1\",\"toAccountId\":\"$SHOP\",\"amount\":700}"
+curl -s -X POST localhost:8088/holds/$HOLD/capture -H 'content-type: application/json' \
+  -d "{\"idempotencyKey\":\"clr-2\",\"toAccountId\":\"$SHOP\",\"amount\":300}"
+
+# give back the last 2.00; the hold is now closed
+curl -s -X POST localhost:8088/holds/$HOLD/release -H 'content-type: application/json' \
+  -d '{"idempotencyKey":"rel-1"}'
+curl -s localhost:8088/holds/$HOLD
 
 curl -s localhost:8088/accounts/$ALICE/statement
 ```
@@ -74,10 +81,10 @@ curl -s localhost:8088/accounts/$ALICE/statement
 | `POST` | `/entries` | post a balanced entry (idempotent) |
 | `GET` | `/entries/{id}` | |
 | `POST` | `/entries/{id}/reverse` | new entry with every posting negated (idempotent) |
-| `POST` | `/holds` | authorize (idempotent) |
-| `GET` | `/holds/{id}` | |
-| `POST` | `/holds/{id}/capture` | move up to the held amount, release the rest |
-| `POST` | `/holds/{id}/release` | |
+| `POST` | `/holds` | authorize, optional `timeoutSeconds` (idempotent) |
+| `GET` | `/holds/{id}` | the hold and its derived state |
+| `POST` | `/holds/{id}/capture` | move up to what remains; may be repeated with new keys (idempotent) |
+| `POST` | `/holds/{id}/release` | give back up to what remains (idempotent) |
 
 Errors: `400 invalid_entry`, `404 not_found`, `409 idempotency_conflict`, `409 invalid_hold_state`, `422 insufficient_funds`.
 
@@ -95,7 +102,11 @@ Errors: `400 invalid_entry`, `404 not_found`, `409 idempotency_conflict`, `409 i
 
 **Idempotency is key + body.** The key alone would make a reused key with a different amount silently return the old result. The stored request hash turns that into a `409`. A race on the same key is resolved by the unique index: the loser reads the winner's row and answers with it.
 
-**Holds are two-phase, and the second phase is where money moves.** `authorize` writes no postings. That keeps the journal about things that happened, and makes "available" a derived number — balance minus pending holds — rather than a second balance to maintain.
+**Holds are two-phase, and the second phase is where money moves.** `authorize` writes no postings. That keeps the journal about things that happened, and makes "available" a derived number — balance minus what remains on open holds — rather than a second balance to maintain.
+
+**A hold's state is a query, like a balance.** The first version of this ledger kept a `status` column on the hold and updated it on capture — the one place where a row about money was edited after the fact. It is gone. A hold is written once; captures are journal entries that point at it, releases are rows in `hold_releases`, and `remaining`, `captured`, `released`, `open / closed / expired` are computed in a view. Several partial captures against one hold fall out of this for free, and so does expiry: there is no sweeper, the state is a function of the clock.
+
+**Where this differs from TigerBeetle.** The account / two-phase transfer model here follows TigerBeetle's shape — pending, post, void, an id-based idempotency contract — because it is the right shape. TigerBeetle stores four counters per account (`debits_pending`, `debits_posted`, `credits_pending`, `credits_posted`) and updates them atomically with each transfer; this ledger stores none and derives everything from the journal. At TigerBeetle's scale the counters are the point. At this scale one invariant is easier to keep true than four, and the counters can be introduced later as a cache behind the same tests — which is the order these things should happen in.
 
 **The database enforces what the application promises.** Immutability and balance are both checked in triggers. The application check gives a good error message; the trigger makes the promise hold even for a direct `psql` session.
 
@@ -104,7 +115,6 @@ Errors: `400 invalid_entry`, `404 not_found`, `409 idempotency_conflict`, `409 i
 ## Not in scope, deliberately
 
 - Multi-currency entries and FX.
-- Hold expiry. A pending hold stays pending until captured or released; a sweeper is a few lines on top of `settled_at`.
 - Authentication, rate limits, pagination.
 - Cached balances and an event stream (outbox) for downstream projections.
 - Migrations beyond "apply the SQL files in order once".
@@ -112,7 +122,8 @@ Errors: `400 invalid_entry`, `404 not_found`, `409 idempotency_conflict`, `409 i
 ## Layout
 
 ```
-db/migrations/001_init.sql     the whole schema, including the two triggers
+db/migrations/001_init.sql     accounts, journal, the balance and immutability triggers
+db/migrations/002_immutable_holds.sql   holds become append-only; hold_state view derives the rest
 src/Ledger.Core/               model, LedgerService (every operation is one transaction), Migrator
 src/Ledger.Api/                minimal API; domain errors → HTTP codes in one middleware
 tests/Ledger.Tests/            xUnit + Testcontainers: entries, holds, concurrency, HTTP

@@ -1,3 +1,4 @@
+using System.Text.Json.Serialization;
 using Ledger.Api;
 using Ledger.Core;
 using Npgsql;
@@ -8,6 +9,7 @@ var connectionString = builder.Configuration.GetConnectionString("Ledger")
     ?? throw new InvalidOperationException("ConnectionStrings:Ledger is not configured");
 builder.Services.AddSingleton(NpgsqlDataSource.Create(connectionString));
 builder.Services.AddSingleton<LedgerService>();
+builder.Services.ConfigureHttpJsonOptions(o => o.SerializerOptions.Converters.Add(new JsonStringEnumConverter()));
 
 var app = builder.Build();
 
@@ -59,16 +61,17 @@ entries.MapPost("/{id:guid}/reverse", async (Guid id, ReverseRequest req, Ledger
 var holds = app.MapGroup("/holds");
 holds.MapPost("/", async (AuthorizeRequest req, LedgerService ledger) =>
 {
-    var hold = await ledger.AuthorizeAsync(req.IdempotencyKey, req.AccountId, req.Amount);
-    return Results.Created($"/holds/{hold.Id}", hold);
+    var timeout = req.TimeoutSeconds is { } secs ? TimeSpan.FromSeconds(secs) : (TimeSpan?)null;
+    var hold = await ledger.AuthorizeAsync(req.IdempotencyKey, req.AccountId, req.Amount, timeout);
+    return Results.Created($"/holds/{hold.Hold.Id}", hold);
 });
 holds.MapGet("/{id:guid}", async (Guid id, LedgerService ledger) => await ledger.GetHoldAsync(id));
 holds.MapPost("/{id:guid}/capture", async (Guid id, CaptureRequest req, LedgerService ledger) =>
 {
-    var (hold, entry) = await ledger.CaptureAsync(id, req.ToAccountId, req.Amount);
+    var (hold, entry) = await ledger.CaptureAsync(id, req.IdempotencyKey, req.ToAccountId, req.Amount);
     return new CaptureResponse(hold, entry);
 });
-holds.MapPost("/{id:guid}/release", async (Guid id, LedgerService ledger) => await ledger.ReleaseAsync(id));
+holds.MapPost("/{id:guid}/release", async (Guid id, ReleaseRequest req, LedgerService ledger) => await ledger.ReleaseAsync(id, req.IdempotencyKey, req.Amount));
 
 app.MapGet("/health", () => Results.Ok(new { status = "ok" }));
 
