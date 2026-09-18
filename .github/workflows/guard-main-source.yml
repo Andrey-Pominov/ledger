@@ -1,0 +1,25 @@
+name: Guard main source
+
+# Pull requests into `main` may come only from `develop`. GitHub rulesets cannot restrict a
+# PR's head branch, so this job is a required status check on `main`: any PR whose head is
+# not `develop` fails here and cannot be merged.
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  verify-source-is-develop:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Ensure PR head branch is develop
+        env:
+          HEAD_REF: ${{ github.head_ref }}
+        run: |
+          if [ "$HEAD_REF" != "develop" ]; then
+            echo "::error::PRs into 'main' are allowed only from 'develop' (got '$HEAD_REF'). Promote through develop."
+            exit 1
+          fi
+          echo "PR head is 'develop' — allowed."
