@@ -42,7 +42,7 @@ accounts.MapPost("/", async (CreateAccountRequest req, LedgerService ledger) =>
     return Results.Created($"/accounts/{account.Id}", AccountResponse.From(await ledger.GetAccountAsync(account.Id)));
 });
 accounts.MapGet("/{id:guid}", async (Guid id, LedgerService ledger) => AccountResponse.From(await ledger.GetAccountAsync(id)));
-accounts.MapGet("/{id:guid}/statement", async (Guid id, LedgerService ledger) => await ledger.StatementAsync(id));
+accounts.MapGet("/{id:guid}/statement", async (Guid id, long? after, int? limit, LedgerService ledger) => await ledger.StatementAsync(id, after ?? 0, limit ?? 100));
 
 var entries = app.MapGroup("/entries");
 entries.MapPost("/", async (PostEntryRequest req, LedgerService ledger) =>

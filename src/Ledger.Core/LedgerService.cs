@@ -44,19 +44,35 @@ public sealed class LedgerService(NpgsqlDataSource db)
         return new AccountView(account, balance, balance - held);
     }
 
-    public async Task<IReadOnlyList<StatementLine>> StatementAsync(Guid accountId, CancellationToken ct = default)
+    /// <summary>
+    /// The account's postings from <paramref name="after"/> forward, each with the balance after it.
+    /// The running balance is continuous across pages: it starts from the sum of everything up to
+    /// the cursor, not from zero. The cursor obeys the same stability rule as the outbox, so a
+    /// page never skips a posting from a transaction that commits late.
+    /// </summary>
+    public async Task<StatementPage> StatementAsync(Guid accountId, long after = 0, int limit = 100, CancellationToken ct = default)
     {
+        if (limit is < 1 or > 1000) throw new InvalidEntryException("limit must be between 1 and 1000");
         await using var conn = await db.OpenConnectionAsync(ct);
         _ = await conn.QuerySingleOrDefaultAsync<Guid?>("select id from accounts where id = @accountId", new { accountId })
             ?? throw new NotFoundException("account", accountId);
-        var rows = await conn.QueryAsync<StatementLine>("""
-            select e.id as EntryId, e.created_at as At, e.description as Description, p.amount as Amount,
-                   (sum(p.amount) over (order by p.id))::bigint as RunningBalance
-            from postings p join entries e on e.id = p.entry_id
+        var lines = (await conn.QueryAsync<StatementLine>("""
+            with before as (
+                select coalesce(sum(amount), 0)::bigint as balance
+                from postings where account_id = @accountId and id <= @after
+            )
+            select p.id as Id, e.id as EntryId, e.created_at as At, e.description as Description, p.amount as Amount,
+                   (before.balance + sum(p.amount) over (order by p.id))::bigint as RunningBalance
+            from postings p
+            join entries e on e.id = p.entry_id
+            cross join before
             where p.account_id = @accountId
+              and p.id > @after
+              and p.xmin::text::bigint < pg_snapshot_xmin(pg_current_snapshot())::text::bigint
             order by p.id
-            """, new { accountId });
-        return rows.ToList();
+            limit @limit
+            """, new { accountId, after, limit })).ToList();
+        return new StatementPage(lines, lines.Count == 0 ? after : lines[^1].Id);
     }
 
     // ---------- entries ----------

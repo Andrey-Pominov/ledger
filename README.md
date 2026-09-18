@@ -82,7 +82,7 @@ curl -s 'localhost:8088/events?after=0&limit=100'
 |---|---|---|
 | `POST` | `/accounts` | create; `allowNegative` marks funding / clearing accounts |
 | `GET` | `/accounts/{id}` | balance and available |
-| `GET` | `/accounts/{id}/statement` | postings with a running balance |
+| `GET` | `/accounts/{id}/statement?after=&limit=` | postings with a running balance, paged by posting id; `next` is the cursor for the following page |
 | `POST` | `/entries` | post a balanced entry (idempotent) |
 | `GET` | `/entries/{id}` | |
 | `POST` | `/entries/{id}/reverse` | new entry with every posting negated (idempotent) |
@@ -116,6 +116,8 @@ Errors: `400 invalid_entry`, `404 not_found`, `409 idempotency_conflict`, `409 i
 
 **The outbox is a table, and the cursor is not the sequence.** Events are rows written in the writer's own transaction — the only way to make "the change happened" and "the change was announced" the same fact. The tempting reader is `WHERE id > cursor`, and it is wrong: `bigserial` assigns ids at `INSERT`, not at `COMMIT`. Transaction A can take id 5, transaction B take 6 and commit first; a reader that sees 6 and moves on will never see 5. The reader therefore accepts only rows whose writing transaction (`xmin`) is older than every transaction still in progress — those cannot be overtaken any more. That rule is one `WHERE` clause in a view, [`events_stable`](db/migrations/003_outbox.sql), and one test that opens a transaction, takes an id, and checks that everything after it is held back until it commits. `xmin` is 32-bit, so the comparison is valid until xid wraparound; that is stated in the migration rather than hidden.
 
+**The statement is paged by the same rule.** Its cursor is the posting id, the running balance on each line is computed from the sum of everything up to the cursor — so it is continuous across pages — and the page is filtered by the same `xmin` clause as the outbox. A cursor over any append-only table has the late-commit problem; it is solved once and used twice.
+
 **The database enforces what the application promises.** Immutability and balance are both checked in triggers. The application check gives a good error message; the trigger makes the promise hold even for a direct `psql` session.
 
 **Plain SQL over an ORM.** A ledger's correctness lives in a dozen statements. They should be readable in the repository as written, with the `FOR UPDATE` visible.
@@ -123,7 +125,7 @@ Errors: `400 invalid_entry`, `404 not_found`, `409 idempotency_conflict`, `409 i
 ## Not in scope, deliberately
 
 - Multi-currency entries and FX.
-- Authentication, rate limits, pagination.
+- Authentication and rate limits.
 - Cached balances. The outbox exists so a projection can be built; none is built here.
 - A broker. The outbox is polled over HTTP; pushing it into Kafka or a queue is a consumer's job, not the ledger's.
 - Migrations beyond "apply the SQL files in order once".
