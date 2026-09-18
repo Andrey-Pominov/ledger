@@ -25,9 +25,12 @@ public sealed class LedgerService(NpgsqlDataSource db)
 
         var account = new Account(Guid.NewGuid(), name.Trim(), currency.ToUpperInvariant(), allowNegative, DateTime.UtcNow);
         await using var conn = await db.OpenConnectionAsync(ct);
+        await using var tx = await conn.BeginTransactionAsync(ct);
         await conn.ExecuteAsync(
             "insert into accounts (id, name, currency, allow_negative, created_at) values (@Id, @Name, @Currency, @AllowNegative, @CreatedAt)",
-            account);
+            account, tx);
+        await EmitAsync(conn, tx, "account.created", account);
+        await tx.CommitAsync(ct);
         return account;
     }
 
@@ -41,19 +44,35 @@ public sealed class LedgerService(NpgsqlDataSource db)
         return new AccountView(account, balance, balance - held);
     }
 
-    public async Task<IReadOnlyList<StatementLine>> StatementAsync(Guid accountId, CancellationToken ct = default)
+    /// <summary>
+    /// The account's postings from <paramref name="after"/> forward, each with the balance after it.
+    /// The running balance is continuous across pages: it starts from the sum of everything up to
+    /// the cursor, not from zero. The cursor obeys the same stability rule as the outbox, so a
+    /// page never skips a posting from a transaction that commits late.
+    /// </summary>
+    public async Task<StatementPage> StatementAsync(Guid accountId, long after = 0, int limit = 100, CancellationToken ct = default)
     {
+        if (limit is < 1 or > 1000) throw new InvalidEntryException("limit must be between 1 and 1000");
         await using var conn = await db.OpenConnectionAsync(ct);
         _ = await conn.QuerySingleOrDefaultAsync<Guid?>("select id from accounts where id = @accountId", new { accountId })
             ?? throw new NotFoundException("account", accountId);
-        var rows = await conn.QueryAsync<StatementLine>("""
-            select e.id as EntryId, e.created_at as At, e.description as Description, p.amount as Amount,
-                   (sum(p.amount) over (order by p.id))::bigint as RunningBalance
-            from postings p join entries e on e.id = p.entry_id
+        var lines = (await conn.QueryAsync<StatementLine>("""
+            with before as (
+                select coalesce(sum(amount), 0)::bigint as balance
+                from postings where account_id = @accountId and id <= @after
+            )
+            select p.id as Id, e.id as EntryId, e.created_at as At, e.description as Description, p.amount as Amount,
+                   (before.balance + sum(p.amount) over (order by p.id))::bigint as RunningBalance
+            from postings p
+            join entries e on e.id = p.entry_id
+            cross join before
             where p.account_id = @accountId
+              and p.id > @after
+              and p.xmin::text::bigint < pg_snapshot_xmin(pg_current_snapshot())::text::bigint
             order by p.id
-            """, new { accountId });
-        return rows.ToList();
+            limit @limit
+            """, new { accountId, after, limit })).ToList();
+        return new StatementPage(lines, lines.Count == 0 ? after : lines[^1].Id);
     }
 
     // ---------- entries ----------
@@ -136,6 +155,7 @@ public sealed class LedgerService(NpgsqlDataSource db)
                 insert into holds (id, idempotency_key, request_hash, account_id, amount, created_at, expires_at)
                 values (@Id, @IdempotencyKey, @hash, @AccountId, @Amount, @CreatedAt, @ExpiresAt)
                 """, new { hold.Id, hold.IdempotencyKey, hash, hold.AccountId, hold.Amount, hold.CreatedAt, hold.ExpiresAt }, tx);
+            await EmitAsync(conn, tx, "hold.authorized", hold);
             await tx.CommitAsync(ct);
             return new HoldView(hold, 0, 0, amount, HoldStatus.Open);
         }
@@ -221,6 +241,7 @@ public sealed class LedgerService(NpgsqlDataSource db)
         await conn.ExecuteAsync(
             "insert into hold_releases (hold_id, idempotency_key, request_hash, amount) values (@holdId, @idempotencyKey, @hash, @releaseAmount)",
             new { holdId, idempotencyKey, hash, releaseAmount }, tx);
+        await EmitAsync(conn, tx, "hold.released", new { HoldId = holdId, IdempotencyKey = idempotencyKey, Amount = releaseAmount, hold.Hold.AccountId });
         await tx.CommitAsync(ct);
         return (await QueryHoldAsync(conn, null, holdId))!;
     }
@@ -236,6 +257,30 @@ public sealed class LedgerService(NpgsqlDataSource db)
         await using var conn = await db.OpenConnectionAsync(ct);
         return await LoadEntryAsync(conn, null, entryId) ?? throw new NotFoundException("entry", entryId);
     }
+
+    // ---------- events ----------
+
+    /// <summary>
+    /// Read the outbox forward from <paramref name="after"/>. Only rows whose transaction is older
+    /// than every transaction still in progress are returned, so a cursor never skips a row that
+    /// commits late — see the comment on <c>events_stable</c> in the migration.
+    /// </summary>
+    public async Task<EventPage> EventsAsync(long after = 0, int limit = 100, CancellationToken ct = default)
+    {
+        if (limit is < 1 or > 1000) throw new InvalidEntryException("limit must be between 1 and 1000");
+        await using var conn = await db.OpenConnectionAsync(ct);
+        var rows = (await conn.QueryAsync<(long id, string type, DateTime occurred_at, string payload)>(
+            "select id, type, occurred_at, payload::text from events_stable where id > @after order by id limit @limit",
+            new { after, limit })).ToList();
+        var events = rows.Select(r => new LedgerEvent(r.id, r.type, r.occurred_at, JsonDocument.Parse(r.payload).RootElement)).ToList();
+        return new EventPage(events, events.Count == 0 ? after : events[^1].Id);
+    }
+
+    private static readonly JsonSerializerOptions EventJson = new(JsonSerializerDefaults.Web);
+
+    private static Task EmitAsync(NpgsqlConnection conn, NpgsqlTransaction tx, string type, object payload)
+        => conn.ExecuteAsync("insert into events (type, payload) values (@type, @payload::jsonb)",
+            new { type, payload = JsonSerializer.Serialize(payload, EventJson) }, tx);
 
     // ---------- internals ----------
 
@@ -274,6 +319,7 @@ public sealed class LedgerService(NpgsqlDataSource db)
         await conn.ExecuteAsync(
             "insert into postings (entry_id, account_id, amount) values (@EntryId, @AccountId, @Amount)",
             entry.Postings.Select(p => new { EntryId = entry.Id, p.AccountId, p.Amount }), tx);
+        await EmitAsync(conn, tx, "entry.posted", new { entry.Id, entry.IdempotencyKey, entry.Description, entry.Reverses, HoldId = holdId, entry.CreatedAt, entry.Postings });
     }
 
     private static async Task<IReadOnlyList<Account>> LockAccountsAsync(NpgsqlConnection conn, NpgsqlTransaction tx, Guid[] ids)

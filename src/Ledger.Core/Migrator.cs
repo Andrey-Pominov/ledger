@@ -13,12 +13,13 @@ public static class Migrator
     public static async Task ApplyAsync(NpgsqlDataSource db, CancellationToken ct = default)
     {
         await using var conn = await db.OpenConnectionAsync(ct);
-        await conn.ExecuteAsync("create table if not exists schema_migrations (name text primary key, applied_at timestamptz not null default now())");
 
-        // One migrator at a time per database.
+        // One migrator at a time per database. The lock comes first: CREATE TABLE IF NOT EXISTS
+        // is not atomic under concurrent creation, so even the bookkeeping table needs it.
         await conn.ExecuteAsync("select pg_advisory_lock(hashtext('ledger.migrations'))");
         try
         {
+            await conn.ExecuteAsync("create table if not exists schema_migrations (name text primary key, applied_at timestamptz not null default now())");
             var applied = (await conn.QueryAsync<string>("select name from schema_migrations")).ToHashSet();
             var asm = Assembly.GetExecutingAssembly();
             var names = asm.GetManifestResourceNames()
