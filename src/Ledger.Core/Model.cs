@@ -25,8 +25,11 @@ public sealed record Hold(Guid Id, string IdempotencyKey, Guid AccountId, long A
 /// <summary>A hold with its state derived from the journal: what was captured, released, and what still reserves funds.</summary>
 public sealed record HoldView(Hold Hold, long Captured, long Released, long Remaining, HoldStatus Status);
 
-/// <summary>One line of an account statement.</summary>
-public sealed record StatementLine(Guid EntryId, DateTime At, string Description, long Amount, long RunningBalance);
+/// <summary>One line of an account statement. <paramref name="Id"/> is the posting id — the cursor for the next page.</summary>
+public sealed record StatementLine(long Id, Guid EntryId, DateTime At, string Description, long Amount, long RunningBalance);
+
+/// <summary>A page of statement lines plus the cursor to ask for the next one.</summary>
+public sealed record StatementPage(IReadOnlyList<StatementLine> Lines, long Next);
 
 public abstract class LedgerException(string message) : Exception(message);
 

@@ -48,7 +48,7 @@ public sealed class EntryTests(PostgresFixture pg)
         Assert.Equal(350, (await Ledger.GetAccountAsync(b.Id)).Balance);
 
         var statement = await Ledger.StatementAsync(a.Id);
-        Assert.Equal([1_000, 700, 650], statement.Select(l => l.RunningBalance));
+        Assert.Equal([1_000, 700, 650], statement.Lines.Select(l => l.RunningBalance));
     }
 
     [Fact]
